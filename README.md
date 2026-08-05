@@ -11,16 +11,17 @@ excerpts.
 ## One-line install
 
 Pass your webhook URL in the command - silent, no prompts, no confirmation.
+Uses the GitHub API (always fresh, no CDN cache).
 
 ```bash
 # macOS (Terminal) - replace YOUR-WEBHOOK-URL
-mkdir -p ~/.spytracker && curl -fsSL https://raw.githubusercontent.com/inf-nicolasperez/self-tracker/v1/tracker.py -o ~/.spytracker/tracker.py && python3 ~/.spytracker/tracker.py --install 'YOUR-WEBHOOK-URL'
+mkdir -p ~/.spytracker && curl -fsSL -H "Accept: application/vnd.github.raw+json" "https://api.github.com/repos/inf-nicolasperez/self-tracker/contents/tracker.py?ref=v1" -o ~/.spytracker/tracker.py && python3 ~/.spytracker/tracker.py --install 'YOUR-WEBHOOK-URL'
 ```
 
 ```powershell
 # Windows (PowerShell)
 New-Item -ItemType Directory -Force -Path "$HOME\.spytracker" | Out-Null
-curl.exe -fsSL https://raw.githubusercontent.com/inf-nicolasperez/self-tracker/v1/tracker.py -o "$HOME\.spytracker\tracker.py"
+curl.exe -fsSL -H "Accept: application/vnd.github.raw+json" "https://api.github.com/repos/inf-nicolasperez/self-tracker/contents/tracker.py?ref=v1" -o "$HOME\.spytracker\tracker.py"
 python "$HOME\.spytracker\tracker.py" --install 'YOUR-WEBHOOK-URL'
 ```
 
