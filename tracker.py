@@ -11,6 +11,7 @@ Usage:
   tracker.py --install            configure, register autostart, start
   tracker.py --uninstall          remove autostart and exit
   tracker.py --test               send a test message to the webhook
+  tracker.py --check              check keystroke permission (macOS)
   tracker.py --once               run until one report is sent, then exit
   tracker.py --dry                collect a short sample and print (no send)
   tracker.py --config <path>      use an alternate config file
@@ -234,8 +235,35 @@ class _MacOS:
         try:
             self._cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
             self._cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+            cg = self._cg
+            cg.CGEventTapCreate.argtypes = [ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
+                                            ctypes.c_uint64, ctypes.c_void_p, ctypes.c_void_p]
+            cg.CGEventTapCreate.restype = ctypes.c_void_p
+            cg.CGEventTapEnable.argtypes = [ctypes.c_void_p, ctypes.c_uint8]
+            cg.CGEventTapEnable.restype = None
+            cg.CGEventGetUnicodeString.argtypes = [ctypes.c_void_p, ctypes.c_ushort,
+                                                   ctypes.POINTER(ctypes.c_ushort)]
+            cg.CGEventGetUnicodeString.restype = ctypes.c_ushort
+            cg.CGEventSourceSecondsSinceLastEventType.restype = ctypes.c_double
+            cg.CGEventSourceSecondsSinceLastEventType.argtypes = [ctypes.c_int32, ctypes.c_int32]
+            cf = self._cf
+            cf.CFMachPortCreateRunLoopSource.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32]
+            cf.CFMachPortCreateRunLoopSource.restype = ctypes.c_void_p
+            cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+            cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+            cf.CFRunLoopGetCurrent.restype = ctypes.c_void_p
+            cf.CFRunLoopAddSource.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+            cf.CFRunLoopAddSource.restype = None
+            cf.CFRunLoopRun.restype = None
         except OSError as e:
             log_line(f"macOS framework load failed: {e}")
+
+    def check_permission(self):
+        """Return True if a key event tap can be created right now."""
+        if not self._cg:
+            return False
+        port = self._cg.CGEventTapCreate(0, 0, 1, 1 << 10, None, None)
+        return bool(port)
 
     def active_app(self):
         try:
@@ -263,59 +291,68 @@ class _MacOS:
         if not self._cg:
             return 0.0
         try:
-            self._cg.CGEventSourceSecondsSinceLastEventType.restype = ctypes.c_double
-            self._cg.CGEventSourceSecondsSinceLastEventType.argtypes = [ctypes.c_int32, ctypes.c_int32]
             return max(0.0, self._cg.CGEventSourceSecondsSinceLastEventType(1, -1))
         except Exception:
             return 0.0
 
     def start_key_capture(self, on_key, running):
-        if not self._cg:
+        if not self._cg or not self._cf:
             log_line("macOS key capture unavailable (framework load failed)")
             return
-        try:
-            cg, cf = self._cg, self._cf
-            kCGEventTapKeyDown = 1 << 10
-            cb_type = ctypes.CFUNCTYPE(
-                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p)
+        self._key_on_event = on_key
+        threading.Thread(target=self._mac_tap_loop, args=(running,), daemon=True).start()
 
-            def tap_callback(proxy, etype, event, ref):
-                try:
-                    buf = (ctypes.c_ushort * 4)()
-                    cg.CGEventGetUnicodeString.argtypes = [ctypes.c_void_p, ctypes.c_ushort,
-                                                           ctypes.POINTER(ctypes.c_ushort)]
-                    cg.CGEventGetUnicodeString.restype = ctypes.c_ushort
-                    n = cg.CGEventGetUnicodeString(event, 4, buf)
-                    raw = "".join(chr(c) for c in buf[:n])
-                    text = "".join(WIN_CTRL_CHARS.get(c, c) for c in raw) or "[KEY]"
-                    on_key(text)
-                except Exception:
-                    pass
-                return None
+    def _mac_tap_loop(self, running):
+        cg, cf = self._cg, self._cf
+        kCGEventTapKeyDown = 1 << 10
+        cb_type = ctypes.CFUNCTYPE(
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p)
+        resp = os.path.realpath(sys.executable)
 
+        def tap_callback(proxy, etype, event, ref):
+            try:
+                buf = (ctypes.c_ushort * 4)()
+                n = cg.CGEventGetUnicodeString(event, 4, buf)
+                raw = "".join(chr(c) for c in buf[:n])
+                text = "".join(WIN_CTRL_CHARS.get(c, c) for c in raw) or "[KEY]"
+                self._key_on_event(text)
+            except Exception:
+                pass
+            return None
+
+        warned = False
+        while running():
             callback = cb_type(tap_callback)
-            cg.CGEventTapCreate.argtypes = [ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
-                                            ctypes.c_uint64, ctypes.c_void_p, ctypes.c_void_p]
-            cg.CGEventTapCreate.restype = ctypes.c_void_p
-            port = cg.CGEventTapCreate(0, 0, 1, ctypes.c_uint64(kCGEventTapKeyDown), callback, None)
+            self._mac_tap_callback = callback
+            port = cg.CGEventTapCreate(0, 0, 1, kCGEventTapKeyDown, callback, None)
             if not port:
-                log_line("WARNING: key capture needs Accessibility permission "
-                         "(System Settings > Privacy & Security > Accessibility); "
-                         "tracker runs without keystrokes until granted.")
-                return
+                if not warned:
+                    log_line("WARNING: keystroke capture blocked. Grant Accessibility to "
+                             f"'{resp}' in System Settings > Privacy & Security > "
+                             "Accessibility (or run the tracker from Terminal, then add "
+                             "Terminal instead). Retrying every 10s - no restart needed "
+                             "once granted.")
+                    warned = True
+                time.sleep(10)
+                continue
+            warned = False
+            log_line("macOS keystroke capture active")
+            try:
+                self._mac_run_tap(cg, cf, port)
+            except Exception as e:
+                log_line(f"macOS key capture runloop error: {e}")
+            time.sleep(2)
 
-            def runloop():
-                cg.CGEventTapEnable.argtypes = [ctypes.c_void_p, ctypes.c_uint8]
-                cg.CGEventTapEnable(port, True)
-                cf.CFMachPortCreateRunLoopSource.restype = ctypes.c_void_p
-                source = cf.CFMachPortCreateRunLoopSource(None, port, 0)
-                cf.CFRunLoopAddSource.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
-                rl = cf.CFRunLoopGetCurrent()
-                cf.CFRunLoopAddSource(rl, source, ctypes.c_void_p(1))  # kCFRunLoopCommonModes
-                cf.CFRunLoopRun()
-            threading.Thread(target=runloop, daemon=True).start()
-        except Exception as e:
-            log_line(f"macOS key capture init failed: {e}")
+    def _mac_run_tap(self, cg, cf, port):
+        cg.CGEventTapEnable(port, True)
+        source = cf.CFMachPortCreateRunLoopSource(None, port, 0)
+        if not source:
+            log_line("macOS key capture: failed to create run loop source")
+            return
+        mode = cf.CFStringCreateWithCString(None, b"kCFRunLoopCommonModes", 0x08000100)
+        rl = cf.CFRunLoopGetCurrent()
+        cf.CFRunLoopAddSource(rl, source, mode)
+        cf.CFRunLoopRun()
 
 
 # ---------------------------------------------------------------- deliver --
@@ -735,6 +772,20 @@ def main():
             tracker.poll_once(time.time())
             time.sleep(poll)
         print(tracker.report(send=False))
+        return
+
+    if "--check" in args:
+        if IS_MAC:
+            ok = tracker._platform.check_permission() if tracker._platform else False
+            if ok:
+                print("OK: keystroke capture permission granted (event tap works)")
+            else:
+                print("BLOCKED: grant Accessibility to '"
+                      + os.path.realpath(sys.executable)
+                      + "' in System Settings > Privacy & Security > Accessibility, "
+                      "then re-run this check.")
+        else:
+            print("OK: keystroke capture needs no permissions on Windows")
         return
 
     if "--test" in args:
