@@ -33,15 +33,18 @@ only (set the URL later in `~/.spytracker/config.json`).
 Discord server → channel settings → **Integrations** → **Webhooks** → New
 Webhook → copy the URL. Paste it when the installer asks.
 
-## 2. Grant macOS permissions (one-time, required for keystrokes)
+## macOS permissions
 
-Windows works out of the box. On macOS:
+The tracker requests them itself. On first run a system dialog appears -
+click **OK** once and it's permanent. It also retries every 5 seconds, so the
+permission can be granted after startup with no restart.
 
-1. **Automation** - the first run prompts: "Terminal wants to control System
-   Events". Click OK (needed for app-name tracking).
-2. **Accessibility** - System Settings → Privacy & Security →
-   Accessibility → enable Terminal (needed for keystroke capture). Without it
-   the tracker runs but logs no keystrokes.
+- **Accessibility** (keystrokes): the tracker calls `CGRequestListenEventAccess()`
+  automatically. If the dialog was missed, run `python3 ~/.spytracker/tracker.py --grant`
+  or add the python binary shown in the report/log to System Settings >
+  Privacy & Security > Accessibility.
+- **Automation** (app names): approve the "control System Events" prompt.
+- Check status anytime: `python3 ~/.spytracker/tracker.py --check`
 
 ## What it sends
 

