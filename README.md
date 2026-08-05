@@ -40,20 +40,35 @@ Windows works out of the box. On macOS:
 
 ## What it sends
 
-Every 60 seconds, a Discord message like:
+Every 60 seconds, a Discord message with per-event detail:
 
 ```
 **my-macbook** | 14:02:11 - 14:03:11 | session 2h 04m
-**Active apps** (last interval):
-  Chrome: 4m 12s
-  VS Code: 38s
+**Apps** (last 60s, time range):
+  Chrome: 4m 12s (14:02:11-14:05:23)
+  VS Code: 38s (14:05:24-14:06:02)
+**Idle:**
+  2m 14s (14:06:03-14:08:17)
 **Keys:** 214 pressed | 1,240 typed (session: 5,102 keys)
-**Typed text:**
-...
+**App switches:**
+  14:05:24 VS Code.exe (project - main.ts)
+**Typed text** (24 events, time + window):
+  14:05:25 VS Code.exe [project - main.ts]: def main
+  14:05:27 VS Code.exe [project - main.ts]: ():
 ```
 
-Plus start/stop notices and full local JSONL history in
-`~/.spytracker/activity.log`.
+Plus start/stop notices. Full local detail:
+
+- `~/.spytracker/events.jsonl` - every keystroke, app switch and idle period,
+  timestamped with the exact window it happened in (machine-readable)
+- `~/.spytracker/activity.log` - one JSON summary line per report
+- `~/.spytracker/tracker.log` - runtime log
+
+Every keystroke event looks like:
+
+```json
+{"type": "key", "ts": 1785894147.71, "app": "Chrome.exe", "title": "gmail.com", "text": "h"}
+```
 
 ## Configuration
 
@@ -67,8 +82,11 @@ Plus start/stop notices and full local JSONL history in
 | `key_poll` | `0.02` | Keystroke poll frequency (50 Hz) |
 | `idle_threshold` | `60` | Seconds of inactivity before counting idle |
 | `keylog_enabled` | `true` | Master switch for keystroke capture |
-| `include_text` | `true` | Include typed-text excerpt in reports |
-| `local_log` | `true` | Append JSONL history locally |
+| `include_text` | `true` | Include typed text in reports |
+| `discord_detail` | `true` | Per-event typed text, app switches, idle ranges in reports |
+| `max_text_events` | `25` | Max typed-text events shown per report |
+| `local_log` | `true` | Append report summaries to `activity.log` |
+| `log_events` | `true` | Append every event to `events.jsonl` |
 | `device_name` | hostname | Shown in reports |
 
 ## Managing
