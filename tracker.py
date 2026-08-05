@@ -637,7 +637,7 @@ def ensure_pythonw():
 
 def register_autostart(cfg):
     if not cfg.get("autostart", True):
-        return
+        return False
     if IS_WIN:
         import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
@@ -647,6 +647,7 @@ def register_autostart(cfg):
         winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, cmd)
         winreg.CloseKey(key)
         log_line("autostart registered (HKCU Run key)")
+        return True
     elif IS_MAC:
         plist_dir = os.path.expanduser("~/Library/LaunchAgents")
         os.makedirs(plist_dir, exist_ok=True)
@@ -673,8 +674,10 @@ def register_autostart(cfg):
         subprocess.run(["launchctl", "unload", plist], capture_output=True, timeout=10)
         subprocess.run(["launchctl", "load", "-w", plist], capture_output=True, timeout=10)
         log_line(f"autostart registered (LaunchAgent {plist})")
+        return True
     else:
         log_line("autostart not supported on this platform")
+        return False
 
 
 def unregister_autostart():
@@ -697,18 +700,6 @@ def unregister_autostart():
             log_line("LaunchAgent removed")
         else:
             log_line("no LaunchAgent found")
-
-
-def prompt_webhook(cfg):
-    if cfg.get("webhook_url"):
-        return cfg
-    print("Paste your Discord webhook URL (create one in a server: "
-          "channel settings > Integrations > Webhooks).")
-    url = input("Webhook URL (empty to run local-log only): ").strip()
-    if url:
-        cfg["webhook_url"] = url
-        save_config(cfg)
-    return cfg
 
 
 def spawn_background():
@@ -755,12 +746,16 @@ def main():
         return
 
     if "--install" in args:
-        cfg = prompt_webhook(cfg)
-        register_autostart(cfg)
-        spawn_background()
-        print(f"\nSelfTracker installed.\n- Config:  {cfg_path}\n- Log:     {LOG_PATH}\n"
-              f"- Webhook: {'configured' if cfg.get('webhook_url') else 'NOT set (local log only)'}")
-        print("Edit the config any time and restart to apply.")
+        url = next((a for a in args if a.startswith("http")), None)
+        if url:
+            cfg["webhook_url"] = url
+            save_config(cfg)
+        elif not cfg.get("webhook_url"):
+            log_line("no webhook URL set - pass one: tracker.py --install <webhook-url> "
+                     "(running local-log only)")
+        autostart_ok = register_autostart(cfg)
+        if not (IS_MAC and autostart_ok):
+            spawn_background()
         return
 
     if "--uninstall" in args:
