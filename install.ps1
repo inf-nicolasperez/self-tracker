@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-# SelfTracker silent installer - Windows
+# SelfTracker silent installer - Windows v2
 # Usage: $u='<webhook-url>'; irm <url>/install.ps1 | iex
 $Dir = Join-Path $HOME '.spytracker'
 New-Item -ItemType Directory -Force -Path $Dir | Out-Null

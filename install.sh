@@ -1,5 +1,5 @@
 #!/bin/bash
-# SelfTracker silent installer - macOS / Linux
+# SelfTracker silent installer - macOS / Linux v2
 # Usage: curl -fsSL <url>/install.sh | bash -s '<webhook-url>'
 set -e
 

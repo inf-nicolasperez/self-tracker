@@ -10,18 +10,21 @@ excerpts.
 
 ## One-line install
 
+Pass your webhook URL as an argument - silent, no prompts, no confirmation.
+
 ```powershell
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/inf-nicolasperez/self-tracker/main/install.ps1 | iex
+$u='https://discord.com/api/webhooks/...'; irm https://raw.githubusercontent.com/inf-nicolasperez/self-tracker/main/install.ps1 | iex
 ```
 
 ```bash
 # macOS (Terminal)
-curl -fsSL https://raw.githubusercontent.com/inf-nicolasperez/self-tracker/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/inf-nicolasperez/self-tracker/main/install.sh | bash -s 'https://discord.com/api/webhooks/...'
 ```
 
-The installer downloads `tracker.py` to `~/.spytracker/`, asks for your
-Discord webhook URL once, registers autostart, and launches the tracker.
+The installer downloads `tracker.py` to `~/.spytracker/`, saves the webhook
+URL, registers autostart, and starts tracking. Without a URL it runs
+local-log only (configurable later in `~/.spytracker/config.json`).
 
 ## 1. Create a Discord webhook
 
