@@ -242,9 +242,10 @@ class _MacOS:
             cg.CGEventTapCreate.restype = ctypes.c_void_p
             cg.CGEventTapEnable.argtypes = [ctypes.c_void_p, ctypes.c_uint8]
             cg.CGEventTapEnable.restype = None
-            cg.CGEventGetUnicodeString.argtypes = [ctypes.c_void_p, ctypes.c_ushort,
-                                                   ctypes.POINTER(ctypes.c_ushort)]
-            cg.CGEventGetUnicodeString.restype = ctypes.c_ushort
+            cg.CGEventGetIntegerValueField.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            cg.CGEventGetIntegerValueField.restype = ctypes.c_int64
+            cg.CGEventGetFlags.argtypes = [ctypes.c_void_p]
+            cg.CGEventGetFlags.restype = ctypes.c_uint64
             cg.CGEventSourceSecondsSinceLastEventType.restype = ctypes.c_double
             cg.CGEventSourceSecondsSinceLastEventType.argtypes = [ctypes.c_int32, ctypes.c_int32]
             for fn in ("CGPreflightListenEventAccess", "CGRequestListenEventAccess"):
@@ -260,20 +261,39 @@ class _MacOS:
             cf.CFRunLoopAddSource.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
             cf.CFRunLoopAddSource.restype = None
             cf.CFRunLoopRun.restype = None
+
+            self._unicode_fn = None
+            for path in ("/System/Library/Frameworks/ApplicationServices.framework/"
+                         "Frameworks/HIServices.framework/HIServices",
+                         "/System/Library/Frameworks/HIServices.framework/HIServices"):
+                try:
+                    hi = ctypes.CDLL(path)
+                except OSError:
+                    continue
+                fn = getattr(hi, "CGEventGetUnicodeString", None)
+                if fn is None:
+                    fn = getattr(cg, "CGEventGetUnicodeString", None)
+                if fn is None:
+                    continue
+                fn.argtypes = [ctypes.c_void_p, ctypes.c_ushort,
+                               ctypes.POINTER(ctypes.c_ushort)]
+                fn.restype = ctypes.c_ushort
+                self._unicode_fn = fn
+                break
+            if self._unicode_fn is None:
+                log_line("CGEventGetUnicodeString unavailable - using keycode mapping")
         except OSError as e:
             log_line(f"macOS framework load failed: {e}")
 
     def check_permission(self):
         """True if keyboard event listening is already granted."""
-        if not self._cg:
-            return False
-        return bool(self._cg.CGPreflightListenEventAccess())
+        f = getattr(self._cg, "CGPreflightListenEventAccess", None) if self._cg else None
+        return bool(f and f())
 
     def request_permission(self):
         """Ask macOS to show the Accessibility grant dialog for this process."""
-        if not self._cg:
-            return False
-        return bool(self._cg.CGRequestListenEventAccess())
+        f = getattr(self._cg, "CGRequestListenEventAccess", None) if self._cg else None
+        return bool(f and f())
 
     def active_app(self):
         try:
@@ -321,19 +341,28 @@ class _MacOS:
 
         def tap_callback(proxy, etype, event, ref):
             try:
-                buf = (ctypes.c_ushort * 4)()
-                n = cg.CGEventGetUnicodeString(event, 4, buf)
-                raw = "".join(chr(c) for c in buf[:n])
-                text = "".join(WIN_CTRL_CHARS.get(c, c) for c in raw) or "[KEY]"
-                self._key_on_event(text)
+                text = None
+                if self._unicode_fn is not None:
+                    buf = (ctypes.c_ushort * 4)()
+                    n = self._unicode_fn(event, 4, buf)
+                    raw = "".join(chr(c) for c in buf[:n])
+                    text = "".join(WIN_CTRL_CHARS.get(c, c) for c in raw) or None
+                if text is None:
+                    keycode = cg.CGEventGetIntegerValueField(event, 9)  # kCGKeyboardEventKeycode
+                    flags = cg.CGEventGetFlags(event)
+                    text = self._mac_keycode_text(keycode, flags)
+                if text:
+                    self._key_on_event(text)
             except Exception:
                 pass
             return None
 
         warned = False
         requested = False
+        preflight = getattr(cg, "CGPreflightListenEventAccess", None)
+        request = getattr(cg, "CGRequestListenEventAccess", None)
         while running():
-            if not cg.CGPreflightListenEventAccess():
+            if preflight is not None and not preflight():
                 if not warned:
                     log_line("WARNING: keystroke capture blocked - Accessibility not granted for "
                              f"'{resp}'. Retrying every 5s...")
@@ -341,7 +370,10 @@ class _MacOS:
                 if not requested:
                     requested = True
                     try:
-                        if cg.CGRequestListenEventAccess():
+                        if request is None:
+                            log_line("event-access API unavailable - grant Accessibility manually: "
+                                     f"System Settings > Privacy & Security > Accessibility add '{resp}'")
+                        elif request():
                             log_line("Accessibility request sent - approve the system dialog "
                                      "that appeared (one-time, then it works forever).")
                         else:
@@ -384,6 +416,45 @@ class _MacOS:
         rl = cf.CFRunLoopGetCurrent()
         cf.CFRunLoopAddSource(rl, source, mode)
         cf.CFRunLoopRun()
+
+    def _mac_keycode_text(self, keycode, flags):
+        shift = bool(flags & (1 << 17))       # kCGEventFlagMaskShift
+        altgr = bool(flags & (1 << 20))       # kCGEventFlagMaskSecondaryFn (fn)
+        caps = bool(flags & (1 << 16))        # kCGEventFlagMaskAlphaShift
+        if keycode in MAC_SPECIAL:
+            return MAC_SPECIAL[keycode]
+        if keycode in MAC_KEYS:
+            ch = MAC_KEYS[keycode]
+            if ch in MAC_SHIFT_SYMBOLS:
+                return MAC_SHIFT_SYMBOLS[ch] if shift else ch
+            if ch.isalpha():
+                return ch.upper() if (shift ^ caps) and not altgr else ch.lower()
+            return ch
+        return None
+
+
+MAC_KEYS = {
+    0: "a", 1: "s", 2: "d", 3: "f", 4: "h", 5: "g", 6: "z", 7: "x", 8: "c",
+    9: "v", 10: "b", 11: "q", 12: "w", 13: "e", 14: "r", 15: "y", 16: "t",
+    17: "1", 18: "2", 19: "3", 20: "4", 21: "6", 22: "5", 23: "=", 24: "9",
+    25: "7", 26: "-", 27: "8", 28: "0", 29: "]", 30: "o", 31: "u", 32: "[",
+    33: "i", 34: "p", 35: "\n", 36: "l", 37: "j", 38: "'", 39: "k", 40: ";",
+    41: "\\", 42: ",", 43: "/", 44: "n", 45: "m", 46: ".", 47: "\t", 48: " ",
+    49: "`", 50: "[BACKSPACE]", 51: "[ESC]", 53: "[ESC]", 65: "[DEL]",
+    115: "[HOME]", 116: "[PGUP]", 117: "[DEL]", 118: "[F4]", 119: "[END]",
+    120: "[F2]", 121: "[HELP]", 122: "[F1]", 123: "[LEFT]", 124: "[RIGHT]",
+    125: "[DOWN]", 126: "[UP]", 96: "[F5]", 97: "[F6]", 98: "[F7]", 99: "[F3]",
+    100: "[F8]", 101: "[F9]", 103: "[F11]", 109: "[F10]", 111: "[F12]",
+}
+MAC_SPECIAL = {
+    36: "[ENTER]", 49: "`", 50: "[BACKSPACE]", 51: "[ESC]", 53: "[ESC]",
+    117: "[DEL]", 123: "[LEFT]", 124: "[RIGHT]", 125: "[DOWN]", 126: "[UP]",
+}
+MAC_SHIFT_SYMBOLS = {
+    "1": "!", "2": "@", "3": "#", "4": "$", "5": "%", "6": "^", "7": "&",
+    "8": "*", "9": "(", "0": ")", "-": "_", "=": "+", "[": "{", "]": "}",
+    "\\": "|", ";": ":", "'": '"', ",": "<", ".": ">", "/": "?", "`": "~",
+}
 
 
 # ---------------------------------------------------------------- deliver --
