@@ -102,7 +102,7 @@ def log_line(msg):
 def load_config(path=CONFIG_PATH):
     cfg = dict(DEFAULTS)
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             cfg.update(json.load(f))
     except (OSError, ValueError):
         pass
@@ -329,7 +329,9 @@ class Webhook:
     def _post(self, payload):
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(self.url, data=data,
-                                     headers={"Content-Type": "application/json"}, method="POST")
+                                     headers={"Content-Type": "application/json",
+                                              "User-Agent": "SelfTracker/1.0 (personal activity tracker)"},
+                                     method="POST")
         with urllib.request.urlopen(req, timeout=15) as resp:
             return resp.status
 
@@ -378,6 +380,7 @@ class Tracker:
         self.webhook = Webhook(cfg.get("webhook_url", ""))
         self.running = threading.Event()
         self.running.set()
+        self.once = False
         self._platform = _Win32() if IS_WIN else _MacOS() if IS_MAC else None
 
         self.current = None
@@ -427,6 +430,8 @@ class Tracker:
             if now - self.last_report >= self.cfg.get("report_interval", 60):
                 self.report()
                 self.last_report = now
+                if self.once:
+                    self.running.clear()
             time.sleep(poll)
 
     def _close_current(self, now):
@@ -675,6 +680,9 @@ def main():
     tracker.started_at = time.time()
     signal.signal(signal.SIGINT, lambda *_: tracker.stop())
     signal.signal(signal.SIGTERM, lambda *_: tracker.stop())
+    tracker.once = "--once" in args
+    if tracker.once:
+        log_line("once mode: will exit after the first report")
 
     if tracker.webhook.enabled:
         tracker.webhook.send(f"**{cfg.get('device_name')}** tracker started. "
